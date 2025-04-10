@@ -10,6 +10,9 @@
 ---@field is_enabled fun(): boolean
 ---@field enable fun()
 ---@field disable fun()
+---@field enableOnly fun(id: string)
+---@field disableExcept fun(id: string)
+
 
 ---@class State
 ---@field enabled boolean
