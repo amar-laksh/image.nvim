@@ -1,21 +1,21 @@
-local magick = require("image/magick")
 local utils = require("image/utils")
 
 -- Images get resized and cropped to fit in the context they are rendered in.
 -- Each of these versions are written to the temp directory and cleared on reboot (on Linux at least).
 -- This is where we keep track of the hashes of the resized and cropped versions of the images so we
 -- can avoid processing and writing the same cropped/resized image variant multiple times.
-local cache = {
-  resized = {}, -- { [`${original_path}:${resize_hash}`]: string }
-  cropped = {}, -- { [`${original_path}:${crop_hash}`]: string }
-}
+---@type table<string, { resized: table<string>, cropped: table<string> }>
+local cache = {}
 
 ---@param image Image
 local render = function(image)
   local state = image.global_state
   local term_size = utils.term.get_size()
-  local image_rows = math.floor(image.image_height / term_size.cell_height)
-  local image_columns = math.floor(image.image_width / term_size.cell_width)
+  local scale_factor = 1.0
+  if type(state.options.scale_factor) == "number" then scale_factor = state.options.scale_factor end
+  local image_rows = math.floor(image.image_height / term_size.cell_height * scale_factor)
+  local image_columns = math.floor(image.image_width / term_size.cell_width * scale_factor)
+  local image_cache = cache[image.original_path] or { resized = {}, cropped = {} }
 
   -- utils.debug(("renderer.render() %s"):format(image.id), {
   --   id = image.id,
@@ -55,12 +55,12 @@ local render = function(image)
   end
 
   -- rendered size cannot be larger than the image itself
-  width = math.min(width, image_columns)
-  height = math.min(height, image_rows)
+  -- width = math.min(width, image_columns)
+  -- height = math.min(height, image_rows)
 
   -- screen max width/height
   width = math.min(width, term_size.screen_cols)
-  height = math.min(height, term_size.screen_rows)
+  -- height = math.min(height, term_size.screen_rows)
 
   -- utils.debug(("(1) x: %d, y: %d, width: %d, height: %d y_offset: %d"):format(original_x, original_y, width, height, y_offset))
 
@@ -119,16 +119,20 @@ local render = function(image)
     bounds.right = bounds.right
     if utils.offsets.get_border_shape(window.id).left > 0 then bounds.right = bounds.right + 1 end
 
-    -- global max window width/height percentage
-    if type(state.options.max_width_window_percentage) == "number" then
-      width =
-          math.min(width, math.floor((window.width - global_offsets.x) * state.options.max_width_window_percentage / 100))
-    end
-    if type(state.options.max_height_window_percentage) == "number" then
-      height = math.min(
-        height,
-        math.floor((window.height - global_offsets.y) * state.options.max_height_window_percentage / 100)
+    local max_width_window_percentage = image.max_width_window_percentage or state.options.max_width_window_percentage
+    local max_height_window_percentage = image.max_height_window_percentage
+      or state.options.max_height_window_percentage
+
+    if type(max_width_window_percentage) == "number" then
+      width = math.min(
+        -- original
+        width,
+        -- max_window_percentage
+        math.floor((window.width - global_offsets.x) * max_width_window_percentage / 100)
       )
+    end
+    if type(max_height_window_percentage) == "number" then
+      height = math.min(height, math.floor((window.height - global_offsets.y) * max_height_window_percentage / 100))
     end
   end
 
@@ -149,9 +153,7 @@ local render = function(image)
   local absolute_x = original_x + x_offset + window_offset_x
   local absolute_y = original_y + y_offset + window_offset_y
 
-  if image.with_virtual_padding then
-    absolute_y = absolute_y + 1
-  end
+  if image.with_virtual_padding then absolute_y = absolute_y + 1 end
 
   local prevent_rendering = false
 
@@ -164,8 +166,11 @@ local render = function(image)
     local botline = win_info.botline
 
     -- bail if out of bounds
-    if original_y + 1 < topline or original_y > botline then
-      -- utils.debug("prevent rendering 1", image.id)
+    if
+      (image.with_virtual_padding and ((topline == original_y + 2 and topfill == 0) or (topline > original_y + 2)))
+      or original_y > botline
+    then
+      -- utils.debug("prevent rendering 1", image.id, { topline = topline, original_y = original_y })
       prevent_rendering = true
     end
 
@@ -197,7 +202,7 @@ local render = function(image)
     -- account for things that push line numbers around
     if image.inline then
       -- bail if the image is above the top of the window at least by one line
-      if topfill == 0 and original_y < topline then
+      if topfill == 0 and original_y < topline - 1 then
         -- utils.debug("prevent rendering 2", image.id)
         prevent_rendering = true
       end
@@ -233,18 +238,13 @@ local render = function(image)
               local virt_height = #(mark_opts.virt_lines or {})
               return { id = mark_id, row = mark_row, col = mark_col, height = virt_height }
             end,
-            vim.api.nvim_buf_get_extmarks(
-              image.buffer,
-              -1,
-              { topline - 1, 0 },
-              { original_y - 1, 0 },
-              { details = true }
-            )
+            vim.api.nvim_buf_get_extmarks(image.buffer, -1, { topline - 1, 0 }, { original_y, 0 }, { details = true })
           )
 
           local extmark_y_offset = topfill
           for _, mark in ipairs(extmarks) do
             if image.extmark and image.extmark.id == mark.id then goto continue end
+            if mark.row > original_y then goto continue end
             if mark.row ~= original_y and mark.id ~= image:get_extmark_id() then
               -- check the mark is inside a fold, and skip adding the offset if it is
               for fold_start, fold_end in pairs(folded_ranges) do
@@ -320,10 +320,10 @@ local render = function(image)
 
   -- clear out of bounds images
   if
-      absolute_y + height <= bounds.top
-      or absolute_y >= bounds.bottom + (vim.o.laststatus == 2 and 1 or 0)
-      or absolute_x + width <= bounds.left
-      or absolute_x >= bounds.right
+    absolute_y + height <= bounds.top
+    or absolute_y >= bounds.bottom + (vim.o.laststatus == 2 and 1 or 0)
+    or absolute_x + width <= bounds.left
+    or absolute_x >= bounds.right
   then
     if image.is_rendered then
       -- utils.debug("deleting out of bounds image", { id = image.id, x = absolute_x, y = absolute_y, width = width, height = height, bounds = bounds })
@@ -366,14 +366,14 @@ local render = function(image)
 
   -- compute resize
   local resize_hash = ("%d-%d"):format(pixel_width, pixel_height)
-  if image.image_width > pixel_width then needs_resize = true end
+  if image.image_width ~= pixel_width then needs_resize = true end
 
   -- TODO make this non-blocking
 
   -- resize
   if needs_resize then
     if image.resize_hash ~= resize_hash then
-      local cached_path = cache.resized[image.path .. ":" .. resize_hash]
+      local cached_path = image_cache.resized[resize_hash]
 
       -- try cache
       if cached_path then
@@ -382,22 +382,10 @@ local render = function(image)
         image.resize_hash = resize_hash
       else
         -- perform resize
-        local resized_image = magick.load_image(image.path)
-        if resized_image then
-          -- utils.debug(("resizing image %s to %dx%d"):format(image.path, pixel_width, pixel_height))
-          --
-          resized_image:set_format("png")
-          resized_image:scale(pixel_width, pixel_height)
-
-          local tmp_path = state.tmp_dir .. "/" .. utils.base64.encode(image.id) .. "-resized-" .. resize_hash .. ".png"
-          resized_image:write(tmp_path)
-          resized_image:destroy()
-
-          image.resized_path = tmp_path
-          image.resize_hash = resize_hash
-
-          cache.resized[image.path .. ":" .. resize_hash] = tmp_path
-        end
+        local tmp_path = state.tmp_dir .. "/" .. vim.base64.encode(image.id) .. "-resized-" .. resize_hash .. ".png"
+        image.resized_path = state.processor.resize(image.path, pixel_width, pixel_height, tmp_path)
+        image.resize_hash = resize_hash
+        image_cache.resized[resize_hash] = image.resized_path
       end
     end
   else
@@ -409,7 +397,7 @@ local render = function(image)
   local crop_hash = ("%d-%d-%d-%d"):format(0, crop_offset_top, pixel_width, cropped_pixel_height)
   if needs_crop and not state.backend.features.crop then
     if (needs_resize and image.resize_hash ~= resize_hash) or image.crop_hash ~= crop_hash then
-      local cached_path = cache.cropped[image.path .. ":" .. crop_hash]
+      local cached_path = image_cache.cropped[crop_hash]
 
       -- try cache;
       if cached_path then
@@ -418,21 +406,17 @@ local render = function(image)
         image.crop_hash = crop_hash
       else
         -- perform crop
-        -- utils.debug(("cropping image %s to %dx%d"):format(image.path, pixel_width, cropped_pixel_height))
-
-        local cropped_image = magick.load_image(image.resized_path or image.path)
-        cropped_image:set_format("png")
-        cropped_image:crop(pixel_width, cropped_pixel_height, 0, crop_offset_top)
-
-        local tmp_path = state.tmp_dir .. "/" .. utils.base64.encode(image.id) .. "-cropped-" .. crop_hash .. ".png"
-        cropped_image:write(tmp_path)
-        cropped_image:destroy()
-
-        image.cropped_path = tmp_path
-
+        local tmp_path = state.tmp_dir .. "/" .. vim.base64.encode(image.id) .. "-cropped-" .. crop_hash .. ".png"
+        image.cropped_path = state.processor.crop(
+          image.resized_path or image.path,
+          0,
+          crop_offset_top,
+          pixel_width,
+          cropped_pixel_height,
+          tmp_path
+        )
         image.crop_hash = crop_hash
-
-        cache.cropped[image.path .. ":" .. crop_hash] = image.cropped_path
+        image_cache.cropped[crop_hash] = image.cropped_path
       end
     end
   elseif needs_crop then
@@ -444,13 +428,13 @@ local render = function(image)
   end
 
   if
-      image.is_rendered
-      and image.rendered_geometry.x == rendered_geometry.x
-      and image.rendered_geometry.y == rendered_geometry.y
-      and image.rendered_geometry.width == rendered_geometry.width
-      and image.rendered_geometry.height == rendered_geometry.height
-      and image.crop_hash == initial_crop_hash
-      and image.resize_hash == initial_resize_hash
+    image.is_rendered
+    and image.rendered_geometry.x == rendered_geometry.x
+    and image.rendered_geometry.y == rendered_geometry.y
+    and image.rendered_geometry.width == rendered_geometry.width
+    and image.rendered_geometry.height == rendered_geometry.height
+    and image.crop_hash == initial_crop_hash
+    and image.resize_hash == initial_resize_hash
   then
     -- utils.debug("skipping render", image.id)
     return true
@@ -461,11 +445,17 @@ local render = function(image)
   image.bounds = bounds
   state.backend.render(image, absolute_x, absolute_y, width, height)
   image.rendered_geometry = rendered_geometry
-  -- utils.debug("rendered", image)
+  cache[image.original_path] = image_cache
 
+  -- utils.debug("rendered", image)
   return true
+end
+
+local clear_cache_for_path = function(path)
+  cache[path] = nil
 end
 
 return {
   render = render,
+  clear_cache_for_path = clear_cache_for_path,
 }

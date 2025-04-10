@@ -1,11 +1,17 @@
 local utils = require("image/utils")
+local processors = require("image/processors")
+local report = require("image/report")
 
 ---@type Options
 local default_options = {
   -- backend = "ueberzug",
   backend = "kitty",
+  processor = "magick_rock",
   integrations = {
     markdown = {
+      enabled = true,
+    },
+    typst = {
       enabled = true,
     },
     neorg = {
@@ -23,11 +29,12 @@ local default_options = {
   },
   max_width = nil,
   max_height = nil,
-  max_width_window_percentage = nil,
+  max_width_window_percentage = 100,
   max_height_window_percentage = 50,
+  scale_factor = 1.0,
   kitty_method = "normal",
   window_overlap_clear_enabled = false,
-  window_overlap_clear_ft_ignore = { "cmp_menu", "cmp_docs", "scrollview", "scrollview_sign" },
+  window_overlap_clear_ft_ignore = { "cmp_menu", "cmp_docs", "snacks_notif", "scrollview", "scrollview_sign" },
   editor_only_render_when_focused = false,
   tmux_show_only_in_active_window = false,
   hijack_file_patterns = { "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.avif" },
@@ -37,6 +44,8 @@ local default_options = {
 local state = {
   ---@diagnostic disable-next-line: assign-type-mismatch
   backend = nil,
+  ---@diagnostic disable-next-line: assign-type-mismatch
+  processor = nil,
   options = default_options,
   images = {},
   extmarks_namespace = vim.api.nvim_create_namespace("image.nvim"),
@@ -57,16 +66,21 @@ api.setup = function(options)
   state.options = opts
 
   vim.schedule(function()
-    local magick = require("image/magick")
-    -- check that magick is available
-    if not magick.has_magick then
-      vim.api.nvim_err_writeln(
-        "image.nvim: magick rock not found, please install it and restart your editor. Error: "
-          .. vim.inspect(magick.magick)
-      )
-      return
+    if opts.processor == "magick_rock" then
+      local magick = require("image/magick")
+      -- check that magick is available
+      if not magick.has_magick then
+        vim.api.nvim_err_writeln(
+          "image.nvim: magick rock not found, please install it and restart your editor. Error: "
+            .. vim.inspect(magick.magick)
+        )
+        return
+      end
     end
   end)
+
+  -- load processor
+  state.processor = processors.get_processor(opts.processor)
 
   -- load backend
   local backend = require("image/backends/" .. opts.backend)
@@ -100,6 +114,10 @@ api.setup = function(options)
 
       if not vim.api.nvim_win_is_valid(winid) then return false end
       if not vim.api.nvim_buf_is_valid(bufnr) then return false end
+
+      -- bail if there are no images
+      local all_images = api.get_images()
+      if #all_images == 0 then return false end
 
       -- toggle images in overlapped windows
       if state.options.window_overlap_clear_enabled then
@@ -264,6 +282,28 @@ api.setup = function(options)
     end,
   })
 
+  -- auto-clear on VimSuspend and re-render on VimResume
+  local image_to_restore_on_resume = {}
+  vim.api.nvim_create_autocmd({ "VimSuspend" }, {
+    group = group,
+    callback = function()
+      local images = api.get_images()
+      for _, current_image in ipairs(images) do
+        current_image:clear()
+      end
+      image_to_restore_on_resume = images
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "VimResume" }, {
+    group = group,
+    callback = function()
+      local images = image_to_restore_on_resume
+      for _, current_image in ipairs(images) do
+        current_image:render()
+      end
+    end,
+  })
+
   -- auto-toggle on editor focus change
   if
     state.options.editor_only_render_when_focused
@@ -271,6 +311,7 @@ api.setup = function(options)
   then
     local images_to_restore_on_focus = {}
     local initial_tmux_window_id = utils.tmux.get_window_id()
+    local initial_tmux_session = utils.tmux.get_current_session()
 
     vim.api.nvim_create_autocmd("FocusLost", {
       group = group,
@@ -283,6 +324,7 @@ api.setup = function(options)
           if
             state.options.editor_only_render_when_focused
             or (utils.tmux.is_tmux and utils.tmux.get_window_id() ~= initial_tmux_window_id)
+            or (utils.tmux.is_tmux and utils.tmux.get_current_session() ~= initial_tmux_session)
           then
             state.disable_decorator_handling = true
 
@@ -309,6 +351,16 @@ api.setup = function(options)
         state.disable_decorator_handling = false
 
         vim.schedule_wrap(function()
+          -- force rerender
+          local images = api.get_images()
+          for _, current_image in ipairs(images) do
+            if current_image.is_rendered then
+              current_image:clear()
+              current_image:render()
+            end
+          end
+
+          -- render images cleared on focus loss
           for _, current_image in ipairs(images_to_restore_on_focus) do
             current_image:render()
           end
@@ -320,7 +372,11 @@ api.setup = function(options)
 
   -- hijack image filetypes
   if state.options.hijack_file_patterns and #state.options.hijack_file_patterns > 0 then
-    vim.api.nvim_create_autocmd({ "BufRead", "WinEnter", "BufWinEnter" }, {
+    vim.api.nvim_create_autocmd({
+      "WinNew",
+      "BufWinEnter",
+      "TabEnter",
+    }, {
       group = group,
       pattern = state.options.hijack_file_patterns,
       callback = function(event)
@@ -356,6 +412,11 @@ api.setup = function(options)
       end
     end,
   })
+
+  -- add :ImageReport
+  vim.api.nvim_create_user_command("ImageReport", function()
+    api.create_report()
+  end, {})
 end
 
 local guard_setup = function()
@@ -371,12 +432,6 @@ api.hijack_buffer = function(path, win, buf, options)
   if not win or win == 0 then win = vim.api.nvim_get_current_win() end
   if not buf or buf == 0 then buf = vim.api.nvim_get_current_buf() end
 
-  local key = ("%s:%s"):format(win, buf)
-  if state.hijacked_win_buf_images[key] then
-    state.hijacked_win_buf_images[key]:render()
-    return state.hijacked_win_buf_images[key]
-  end
-
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, true, { "" })
 
@@ -387,6 +442,12 @@ api.hijack_buffer = function(path, win, buf, options)
   vim.opt_local.cursorline = false
   vim.opt_local.number = false
   vim.opt_local.signcolumn = "no"
+
+  local key = ("%s:%s"):format(win, buf)
+  if state.hijacked_win_buf_images[key] then
+    state.hijacked_win_buf_images[key]:render()
+    return state.hijacked_win_buf_images[key]
+  end
 
   local opts = options or {}
   opts.window = win
@@ -469,6 +530,10 @@ api.disable = function()
   for _, current_image in ipairs(images) do
     current_image:clear(true)
   end
+
+api.create_report = function()
+  guard_setup()
+  return report.create(state)
 end
 
 return api

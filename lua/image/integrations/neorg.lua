@@ -23,6 +23,7 @@ return document.create_document_integration({
     clear_in_insert_mode = false,
     download_remote_images = true,
     only_render_image_at_cursor = false,
+    floating_windows = false,
     filetypes = { "norg" },
   },
   query_buffer_images = function(buffer)
@@ -35,7 +36,7 @@ return document.create_document_integration({
     local images = {}
 
     ---@diagnostic disable-next-line: missing-parameter
-    for id, node in query:iter_captures(root, 0) do
+    for id, node in query:iter_captures(root, buf) do
       local capture = query.captures[id]
 
       -- assume that everything after the tag + one space is the path/url and trim it
