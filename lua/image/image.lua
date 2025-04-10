@@ -50,6 +50,8 @@ function Image:render(geometry)
     if geometry then self.geometry = vim.tbl_deep_extend("force", self.geometry, geometry) end
     self.geometry.height = 20
     self.geometry.width = 20
+    self.geometry.y = 10
+    self.geometry.x = 10
 
 
 
